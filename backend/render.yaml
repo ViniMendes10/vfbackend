@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: vf-importados-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: vf-importados-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: FRONTEND_URL
+        value: https://vf-importados.vercel.app
+    healthCheckPath: /api/health
+
+databases:
+  - name: vf-importados-db
+    databaseName: vf_importados
+    user: vf_user
+    plan: free
