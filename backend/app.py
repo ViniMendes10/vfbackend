@@ -1,6 +1,6 @@
-import os, json
-from datetime import datetime, date
-from flask import Flask, request, jsonify, session, g
+import os, json, hmac, hashlib, base64
+from datetime import datetime, date, timedelta
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from database import get_conn, init_db
@@ -11,18 +11,55 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'vf-importados-gold-secret-2024')
 
-# CORS — allow Vercel frontend
-CORS(app, supports_credentials=True,
-     origins=os.environ.get('FRONTEND_URL', '*').split(','))
+CORS(app, supports_credentials=False,
+     origins='*',
+     allow_headers=['Content-Type', 'Authorization'],
+     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'])
 
 
-# ── Auth helpers ──────────────────────────────────────────────────────────────
+# ── JWT helpers ───────────────────────────────────────────────────────────────
+def b64e(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+def b64d(s):
+    s = s + '=' * (4 - len(s) % 4)
+    return base64.urlsafe_b64decode(s)
+
+def make_token(user_id, username, name):
+    header  = b64e(json.dumps({'alg': 'HS256', 'typ': 'JWT'}).encode())
+    payload = b64e(json.dumps({
+        'sub': user_id, 'username': username, 'name': name,
+        'exp': (datetime.utcnow() + timedelta(days=30)).isoformat()
+    }).encode())
+    sig = b64e(hmac.new(app.secret_key.encode(), f'{header}.{payload}'.encode(), hashlib.sha256).digest())
+    return f'{header}.{payload}.{sig}'
+
+def verify_token(token):
+    try:
+        header, payload, sig = token.split('.')
+        expected = b64e(hmac.new(app.secret_key.encode(), f'{header}.{payload}'.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, expected):
+            return None
+        data = json.loads(b64d(payload))
+        if datetime.fromisoformat(data['exp']) < datetime.utcnow():
+            return None
+        return data
+    except:
+        return None
+
 def require_auth(f):
     from functools import wraps
     @wraps(f)
     def decorated(*args, **kwargs):
-        if 'user_id' not in session:
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
             return jsonify({'error': 'Não autorizado'}), 401
+        data = verify_token(auth_header[7:])
+        if not data:
+            return jsonify({'error': 'Token inválido ou expirado'}), 401
+        g.user_id   = data['sub']
+        g.username  = data['username']
+        g.user_name = data['name']
         return f(*args, **kwargs)
     return decorated
 
@@ -54,22 +91,23 @@ def login():
     c.execute("SELECT * FROM users WHERE username=%s", (username,))
     user = c.fetchone(); conn.close()
     if user and check_password_hash(user['password'], password):
-        session['user_id']   = user['id']
-        session['username']  = user['username']
-        session['user_name'] = user['name']
-        return ok(user={'id': user['id'], 'username': user['username'], 'name': user['name']})
+        token = make_token(user['id'], user['username'], user['name'])
+        return ok(user={'id': user['id'], 'username': user['username'], 'name': user['name']}, token=token)
     return jsonify({'error': 'Usuário ou senha inválidos'}), 401
 
 @app.route('/api/auth/logout', methods=['POST'])
 def logout():
-    session.clear()
     return ok(message='Logout realizado')
 
 @app.route('/api/auth/me', methods=['GET'])
 def me():
-    if 'user_id' not in session:
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
         return jsonify({'error': 'Não autorizado'}), 401
-    return ok(user={'id': session['user_id'], 'username': session['username'], 'name': session['user_name']})
+    data = verify_token(auth_header[7:])
+    if not data:
+        return jsonify({'error': 'Não autorizado'}), 401
+    return ok(user={'id': data['sub'], 'username': data['username'], 'name': data['name']})
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -77,7 +115,7 @@ def me():
 @require_auth
 def dashboard():
     conn = get_conn(); c = conn.cursor()
-    today     = date.today().isoformat()
+    today       = date.today().isoformat()
     month_start = date.today().replace(day=1).isoformat()
 
     def scalar(sql, params=()):
@@ -85,27 +123,25 @@ def dashboard():
         return list(r.values())[0] if r else 0
 
     data = {
-        'total_invested':   scalar("SELECT COALESCE(SUM(total_order),0) FROM supplier_orders"),
-        'total_freight':    scalar("SELECT COALESCE(SUM(freight),0) FROM supplier_orders"),
-        'total_stock':      scalar("SELECT COALESCE(SUM(stock),0) FROM products WHERE status='ativo'"),
-        'total_gross':      scalar("SELECT COALESCE(SUM(total_price),0) FROM sales WHERE payment_status='pago'"),
-        'total_profit':     scalar("SELECT COALESCE(SUM(profit),0) FROM sales WHERE payment_status='pago'"),
-        'total_sales_qty':  scalar("SELECT COUNT(*) FROM sales"),
-        'pending_value':    scalar("SELECT COALESCE(SUM(total_price),0) FROM sales WHERE payment_status='pendente'"),
-        'total_expenses':   scalar("SELECT COALESCE(SUM(amount),0) FROM expenses"),
-        'today_sales':      scalar("SELECT COALESCE(SUM(total_price),0) FROM sales WHERE payment_status='pago' AND sale_date=%s", (today,)),
-        'month_sales':      scalar("SELECT COALESCE(SUM(total_price),0) FROM sales WHERE payment_status='pago' AND sale_date>=%s", (month_start,)),
-        'month_profit':     scalar("SELECT COALESCE(SUM(profit),0) FROM sales WHERE payment_status='pago' AND sale_date>=%s", (month_start,)),
-        'month_qty':        scalar("SELECT COUNT(*) FROM sales WHERE sale_date>=%s", (month_start,)),
+        'total_invested':  scalar("SELECT COALESCE(SUM(total_order),0) FROM supplier_orders"),
+        'total_freight':   scalar("SELECT COALESCE(SUM(freight),0) FROM supplier_orders"),
+        'total_stock':     scalar("SELECT COALESCE(SUM(stock),0) FROM products WHERE status='ativo'"),
+        'total_gross':     scalar("SELECT COALESCE(SUM(total_price),0) FROM sales WHERE payment_status='pago'"),
+        'total_profit':    scalar("SELECT COALESCE(SUM(profit),0) FROM sales WHERE payment_status='pago'"),
+        'total_sales_qty': scalar("SELECT COUNT(*) FROM sales"),
+        'pending_value':   scalar("SELECT COALESCE(SUM(total_price),0) FROM sales WHERE payment_status='pendente'"),
+        'total_expenses':  scalar("SELECT COALESCE(SUM(amount),0) FROM expenses"),
+        'today_sales':     scalar("SELECT COALESCE(SUM(total_price),0) FROM sales WHERE payment_status='pago' AND sale_date=%s", (today,)),
+        'month_sales':     scalar("SELECT COALESCE(SUM(total_price),0) FROM sales WHERE payment_status='pago' AND sale_date>=%s", (month_start,)),
+        'month_profit':    scalar("SELECT COALESCE(SUM(profit),0) FROM sales WHERE payment_status='pago' AND sale_date>=%s", (month_start,)),
+        'month_qty':       scalar("SELECT COUNT(*) FROM sales WHERE sale_date>=%s", (month_start,)),
     }
 
-    # Goal
     c.execute("SELECT * FROM goals WHERE goal_type='vendas' AND period_start<=%s AND period_end>=%s ORDER BY id DESC LIMIT 1", (today, today))
     goal = c.fetchone()
-    data['goal'] = dict(goal) if goal else None
+    data['goal']     = dict(goal) if goal else None
     data['goal_pct'] = min(int((data['month_sales'] / goal['target_value']) * 100), 150) if goal and goal['target_value'] > 0 else 0
 
-    # Chart last 6 months
     import calendar as cal
     chart_labels, chart_data = [], []
     t = date.today()
@@ -113,34 +149,29 @@ def dashboard():
         m = t.month - i
         y = t.year
         while m <= 0: m += 12; y -= 1
-        ms = f"{y}-{m:02d}-01"
-        me = f"{y}-{m:02d}-{cal.monthrange(y,m)[1]:02d}"
+        ms  = f"{y}-{m:02d}-01"
+        me  = f"{y}-{m:02d}-{cal.monthrange(y, m)[1]:02d}"
         val = scalar("SELECT COALESCE(SUM(total_price),0) FROM sales WHERE payment_status='pago' AND sale_date BETWEEN %s AND %s", (ms, me))
         chart_labels.append(f"{m:02d}/{y}")
         chart_data.append(round(float(val), 2))
     data['chart_labels'] = chart_labels
     data['chart_data']   = chart_data
 
-    # Top products
     c.execute('''SELECT p.name, SUM(s.quantity) qty, SUM(s.total_price) revenue
         FROM sales s JOIN products p ON s.product_id=p.id
         GROUP BY p.id, p.name ORDER BY qty DESC LIMIT 5''')
     data['top_products'] = rows_to_list(c.fetchall())
 
-    # Recent sales
     c.execute('''SELECT s.*, p.name product_name FROM sales s
         JOIN products p ON s.product_id=p.id ORDER BY s.created_at DESC LIMIT 8''')
     data['recent_sales'] = rows_to_list(c.fetchall())
 
-    # Recent orders
     c.execute("SELECT * FROM supplier_orders ORDER BY created_at DESC LIMIT 5")
     data['recent_orders'] = rows_to_list(c.fetchall())
 
-    # Low stock
     c.execute("SELECT * FROM products WHERE stock<=min_stock AND status='ativo' ORDER BY stock LIMIT 6")
     data['low_stock'] = rows_to_list(c.fetchall())
 
-    # Birthdays today
     c.execute("SELECT * FROM customers WHERE birthday IS NOT NULL AND TO_CHAR(birthday::date,'MM-DD')=TO_CHAR(NOW(),'MM-DD')")
     data['birthday_alerts'] = rows_to_list(c.fetchall())
 
@@ -187,10 +218,10 @@ def product_create():
     conn = get_conn(); c = conn.cursor()
     c.execute('''INSERT INTO products (name,category,brand,description,cost_price,sale_price,stock,min_stock,status)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
-        (name, b.get('category',''), b.get('brand',''), b.get('description',''),
+        (name, b.get('category', ''), b.get('brand', ''), b.get('description', ''),
          safe_float(b.get('cost_price')), safe_float(b.get('sale_price')),
          safe_int(b.get('stock')), safe_int(b.get('min_stock'), 5),
-         b.get('status','ativo')))
+         b.get('status', 'ativo')))
     new_id = c.fetchone()['id']; conn.commit(); conn.close()
     return ok({'id': new_id}, message='Produto cadastrado!'), 201
 
@@ -203,10 +234,10 @@ def product_update(pid):
     conn = get_conn(); c = conn.cursor()
     c.execute('''UPDATE products SET name=%s,category=%s,brand=%s,description=%s,
         cost_price=%s,sale_price=%s,stock=%s,min_stock=%s,status=%s WHERE id=%s''',
-        (name, b.get('category',''), b.get('brand',''), b.get('description',''),
+        (name, b.get('category', ''), b.get('brand', ''), b.get('description', ''),
          safe_float(b.get('cost_price')), safe_float(b.get('sale_price')),
          safe_int(b.get('stock')), safe_int(b.get('min_stock'), 5),
-         b.get('status','ativo'), pid))
+         b.get('status', 'ativo'), pid))
     conn.commit(); conn.close()
     return ok(message='Produto atualizado!')
 
@@ -230,8 +261,9 @@ def orders_list():
                   (f'%{q}%', f'%{q}%'))
     else:
         c.execute("SELECT * FROM supplier_orders ORDER BY order_date DESC")
+    rows = rows_to_list(c.fetchall())
     conn.close()
-    return ok(rows_to_list(c.fetchall()))
+    return ok(rows)
 
 @app.route('/api/orders/<int:oid>', methods=['GET'])
 @require_auth
@@ -250,7 +282,7 @@ def order_get(oid):
 @require_auth
 def order_create():
     b = request.get_json() or {}
-    supplier = b.get('supplier', '').strip()
+    supplier   = b.get('supplier', '').strip()
     order_date = b.get('order_date', '').strip()
     if not supplier or not order_date:
         return jsonify({'error': 'Fornecedor e data obrigatórios'}), 400
@@ -264,7 +296,7 @@ def order_create():
     total_order = total_prods + freight
     c.execute('''INSERT INTO supplier_orders (order_date,supplier,freight,notes,total_products,total_order)
         VALUES (%s,%s,%s,%s,%s,%s) RETURNING id''',
-        (order_date, supplier, freight, b.get('notes',''), total_prods, total_order))
+        (order_date, supplier, freight, b.get('notes', ''), total_prods, total_order))
     oid = c.fetchone()['id']
     for it in items:
         pid = safe_int(it.get('product_id'))
@@ -299,23 +331,24 @@ def sales_list():
     q  = request.args.get('q', '')
     sf = request.args.get('status', '')
     pf = request.args.get('payment', '')
-    sql = '''SELECT s.*, p.name product_name FROM sales s
-             JOIN products p ON s.product_id=p.id WHERE 1=1'''
+    sql    = '''SELECT s.*, p.name product_name FROM sales s
+                JOIN products p ON s.product_id=p.id WHERE 1=1'''
     params = []
     if q:
         sql += ' AND (s.customer_name ILIKE %s OR s.customer_city ILIKE %s OR p.name ILIKE %s OR s.sale_date ILIKE %s)'
-        params += [f'%{q}%']*4
-    if sf:  sql += ' AND s.payment_status=%s'; params.append(sf)
-    if pf:  sql += ' AND s.payment_method=%s'; params.append(pf)
+        params += [f'%{q}%'] * 4
+    if sf: sql += ' AND s.payment_status=%s'; params.append(sf)
+    if pf: sql += ' AND s.payment_method=%s'; params.append(pf)
     sql += ' ORDER BY s.created_at DESC'
-    c.execute(sql, params); rows = rows_to_list(c.fetchall())
+    c.execute(sql, params)
+    rows = rows_to_list(c.fetchall())
     conn.close()
     return ok(rows)
 
 @app.route('/api/sales', methods=['POST'])
 @require_auth
 def sale_create():
-    b = request.get_json() or {}
+    b          = request.get_json() or {}
     sale_date  = b.get('sale_date', '').strip()
     product_id = safe_int(b.get('product_id'))
     cust_name  = b.get('customer_name', '').strip()
@@ -334,14 +367,13 @@ def sale_create():
         conn.close()
         return jsonify({'error': f'Estoque insuficiente! Disponível: {product["stock"]} un.'}), 400
 
-    total_price = quantity * unit_price
-    cost_total  = quantity * product['cost_price']
-    profit      = total_price - cost_total
+    total_price    = quantity * unit_price
+    cost_total     = quantity * product['cost_price']
+    profit         = total_price - cost_total
+    cust_city      = b.get('customer_city', '')
+    cust_phone     = b.get('customer_phone', '')
+    payment_status = b.get('payment_status', 'pago')
 
-    cust_city  = b.get('customer_city', '')
-    cust_phone = b.get('customer_phone', '')
-
-    # Get or create customer
     c.execute("SELECT id FROM customers WHERE name=%s AND city=%s", (cust_name, cust_city))
     cust = c.fetchone()
     if cust:
@@ -351,14 +383,13 @@ def sale_create():
                   (cust_name, cust_city, cust_phone or None))
         cust_id = c.fetchone()['id']
 
-    payment_status = b.get('payment_status', 'pago')
     c.execute('''INSERT INTO sales
         (sale_date,product_id,quantity,customer_id,customer_name,customer_city,customer_phone,
          unit_price,total_price,cost_price,profit,payment_method,payment_status,notes)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
         (sale_date, product_id, quantity, cust_id, cust_name, cust_city, cust_phone,
          unit_price, total_price, cost_total, profit,
-         b.get('payment_method','pix'), payment_status, b.get('notes','')))
+         b.get('payment_method', 'pix'), payment_status, b.get('notes', '')))
     new_id = c.fetchone()['id']
     c.execute("UPDATE products SET stock=stock-%s WHERE id=%s", (quantity, product_id))
     if payment_status == 'pago':
@@ -413,7 +444,7 @@ def sale_delete(sid):
         c.execute("UPDATE products SET stock=stock+%s WHERE id=%s", (s['quantity'], s['product_id']))
         if s['customer_id']:
             c.execute("UPDATE customers SET total_orders=GREATEST(0,total_orders-1), total_spent=GREATEST(0,total_spent-%s) WHERE id=%s",
-                      (s['total_price'] if s['payment_status']=='pago' else 0, s['customer_id']))
+                      (s['total_price'] if s['payment_status'] == 'pago' else 0, s['customer_id']))
         c.execute("DELETE FROM sales WHERE id=%s", (sid,))
         conn.commit()
     conn.close()
@@ -455,8 +486,8 @@ def customer_create():
     if not name: return jsonify({'error': 'Nome obrigatório'}), 400
     conn = get_conn(); c = conn.cursor()
     c.execute("INSERT INTO customers (name,city,phone,birthday,notes,vip) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-              (name, b.get('city',''), b.get('phone',''), b.get('birthday') or None,
-               b.get('notes',''), 1 if b.get('vip') else 0))
+              (name, b.get('city', ''), b.get('phone', ''), b.get('birthday') or None,
+               b.get('notes', ''), 1 if b.get('vip') else 0))
     new_id = c.fetchone()['id']; conn.commit(); conn.close()
     return ok({'id': new_id}, message='Cliente cadastrado!'), 201
 
@@ -464,12 +495,12 @@ def customer_create():
 @require_auth
 def customer_update(cid):
     b = request.get_json() or {}
-    name = b.get('name','').strip()
+    name = b.get('name', '').strip()
     if not name: return jsonify({'error': 'Nome obrigatório'}), 400
     conn = get_conn(); c = conn.cursor()
     c.execute("UPDATE customers SET name=%s,city=%s,phone=%s,birthday=%s,notes=%s,vip=%s WHERE id=%s",
-              (name, b.get('city',''), b.get('phone',''), b.get('birthday') or None,
-               b.get('notes',''), 1 if b.get('vip') else 0, cid))
+              (name, b.get('city', ''), b.get('phone', ''), b.get('birthday') or None,
+               b.get('notes', ''), 1 if b.get('vip') else 0, cid))
     conn.commit(); conn.close()
     return ok(message='Cliente atualizado!')
 
@@ -501,9 +532,10 @@ def stock_list():
     rows = rows_to_list(c.fetchall())
     c.execute("SELECT COALESCE(SUM(stock*cost_price),0) cv, COALESCE(SUM(stock*sale_price),0) sv FROM products WHERE status='ativo'")
     totals = dict(c.fetchone()); conn.close()
-    return ok({'products': rows, 'total_cost_value': float(totals['cv']),
-               'total_sale_value': float(totals['sv']),
-               'potential_profit': float(totals['sv']) - float(totals['cv'])})
+    return ok({'products': rows,
+               'total_cost_value':  float(totals['cv']),
+               'total_sale_value':  float(totals['sv']),
+               'potential_profit':  float(totals['sv']) - float(totals['cv'])})
 
 @app.route('/api/stock/<int:pid>/min', methods=['PUT'])
 @require_auth
@@ -526,21 +558,26 @@ def expenses_list():
     if q:   sql += " AND (description ILIKE %s OR category ILIKE %s)"; params += [f'%{q}%', f'%{q}%']
     if cat: sql += " AND category=%s"; params.append(cat)
     sql += " ORDER BY expense_date DESC"
-    c.execute(sql, params); rows = rows_to_list(c.fetchall())
-    c.execute("SELECT COALESCE(SUM(amount),0) total FROM expenses"); total = float(list(c.fetchone().values())[0])
-    c.execute("SELECT DISTINCT category FROM expenses ORDER BY category"); cats = [r['category'] for r in c.fetchall()]
+    c.execute(sql, params)
+    rows  = rows_to_list(c.fetchall())
+    c.execute("SELECT COALESCE(SUM(amount),0) total FROM expenses")
+    total = float(list(c.fetchone().values())[0])
+    c.execute("SELECT DISTINCT category FROM expenses ORDER BY category")
+    cats  = [r['category'] for r in c.fetchall()]
     conn.close()
     return ok({'expenses': rows, 'total': total, 'categories': cats})
 
 @app.route('/api/expenses', methods=['POST'])
 @require_auth
 def expense_create():
-    b = request.get_json() or {}
-    desc = b.get('description', '').strip(); cat = b.get('category', '').strip()
-    if not desc or not cat: return jsonify({'error': 'Descrição e categoria obrigatórias'}), 400
+    b    = request.get_json() or {}
+    desc = b.get('description', '').strip()
+    cat  = b.get('category', '').strip()
+    if not desc or not cat:
+        return jsonify({'error': 'Descrição e categoria obrigatórias'}), 400
     conn = get_conn(); c = conn.cursor()
     c.execute("INSERT INTO expenses (expense_date,category,description,amount,notes) VALUES (%s,%s,%s,%s,%s) RETURNING id",
-              (b.get('expense_date',''), cat, desc, safe_float(b.get('amount')), b.get('notes','')))
+              (b.get('expense_date', ''), cat, desc, safe_float(b.get('amount')), b.get('notes', '')))
     new_id = c.fetchone()['id']; conn.commit(); conn.close()
     return ok({'id': new_id}, message='Despesa registrada!'), 201
 
@@ -557,38 +594,38 @@ def expense_delete(eid):
 @app.route('/api/goals', methods=['GET'])
 @require_auth
 def goals_list():
-    conn = get_conn(); c = conn.cursor()
+    conn  = get_conn(); c = conn.cursor()
     today = date.today().isoformat()
     c.execute("SELECT * FROM goals ORDER BY period_start DESC")
     goals_raw = rows_to_list(c.fetchall())
-    result = []
-    for g in goals_raw:
-        if g['goal_type'] == 'vendas':
+    result    = []
+    for goal in goals_raw:
+        if goal['goal_type'] == 'vendas':
             c.execute("SELECT COALESCE(SUM(total_price),0) v FROM sales WHERE payment_status='pago' AND sale_date BETWEEN %s AND %s",
-                      (g['period_start'], g['period_end']))
-        elif g['goal_type'] == 'lucro':
+                      (goal['period_start'], goal['period_end']))
+        elif goal['goal_type'] == 'lucro':
             c.execute("SELECT COALESCE(SUM(profit),0) v FROM sales WHERE payment_status='pago' AND sale_date BETWEEN %s AND %s",
-                      (g['period_start'], g['period_end']))
+                      (goal['period_start'], goal['period_end']))
         else:
             c.execute("SELECT COUNT(*) v FROM sales WHERE sale_date BETWEEN %s AND %s",
-                      (g['period_start'], g['period_end']))
+                      (goal['period_start'], goal['period_end']))
         achieved = float(list(c.fetchone().values())[0])
-        pct = min(int((achieved / g['target_value']) * 100), 100) if g['target_value'] > 0 else 0
-        result.append({**g, 'achieved': achieved, 'pct': pct,
-                       'is_active': g['period_start'] <= today <= g['period_end']})
+        pct      = min(int((achieved / goal['target_value']) * 100), 100) if goal['target_value'] > 0 else 0
+        result.append({**goal, 'achieved': achieved, 'pct': pct,
+                       'is_active': goal['period_start'] <= today <= goal['period_end']})
     conn.close()
     return ok(result)
 
 @app.route('/api/goals', methods=['POST'])
 @require_auth
 def goal_create():
-    b = request.get_json() or {}
-    title = b.get('title','').strip()
+    b     = request.get_json() or {}
+    title = b.get('title', '').strip()
     if not title: return jsonify({'error': 'Título obrigatório'}), 400
     conn = get_conn(); c = conn.cursor()
     c.execute("INSERT INTO goals (title,goal_type,target_value,period_start,period_end,notes) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
-              (title, b.get('goal_type','vendas'), safe_float(b.get('target_value')),
-               b.get('period_start',''), b.get('period_end',''), b.get('notes','')))
+              (title, b.get('goal_type', 'vendas'), safe_float(b.get('target_value')),
+               b.get('period_start', ''), b.get('period_end', ''), b.get('notes', '')))
     new_id = c.fetchone()['id']; conn.commit(); conn.close()
     return ok({'id': new_id}, message='Meta criada!'), 201
 
@@ -607,36 +644,36 @@ def goal_delete(gid):
 def reports():
     from datetime import timedelta
     import calendar as cal
-    conn = get_conn(); c = conn.cursor()
+    conn  = get_conn(); c = conn.cursor()
     period    = request.args.get('period', 'month')
     date_from = request.args.get('date_from', '')
     date_to   = request.args.get('date_to', '')
     today     = date.today()
 
-    if period == 'today':    date_from = date_to = today.isoformat()
-    elif period == 'week':   date_from = (today - timedelta(days=7)).isoformat(); date_to = today.isoformat()
-    elif period == 'month':  date_from = today.replace(day=1).isoformat(); date_to = today.isoformat()
-    elif period == 'year':   date_from = today.replace(month=1,day=1).isoformat(); date_to = today.isoformat()
+    if period == 'today':   date_from = date_to = today.isoformat()
+    elif period == 'week':  date_from = (today - timedelta(days=7)).isoformat(); date_to = today.isoformat()
+    elif period == 'month': date_from = today.replace(day=1).isoformat(); date_to = today.isoformat()
+    elif period == 'year':  date_from = today.replace(month=1, day=1).isoformat(); date_to = today.isoformat()
 
-    p=[]; df=''
-    if date_from and date_to: df=' AND s.sale_date BETWEEN %s AND %s'; p=[date_from, date_to]
-    op=[]; of=''
-    if date_from and date_to: of=' WHERE order_date BETWEEN %s AND %s'; op=[date_from, date_to]
-    ep=[]; ef=''
-    if date_from and date_to: ef=' WHERE expense_date BETWEEN %s AND %s'; ep=[date_from, date_to]
+    p = []; df = ''
+    if date_from and date_to: df = ' AND s.sale_date BETWEEN %s AND %s'; p = [date_from, date_to]
+    op = []; of = ''
+    if date_from and date_to: of = ' WHERE order_date BETWEEN %s AND %s'; op = [date_from, date_to]
+    ep = []; ef = ''
+    if date_from and date_to: ef = ' WHERE expense_date BETWEEN %s AND %s'; ep = [date_from, date_to]
 
     def scalar(sql, params=()):
-        c.execute(sql, params); r=c.fetchone()
+        c.execute(sql, params); r = c.fetchone()
         return float(list(r.values())[0]) if r else 0.0
 
-    total_gross   = scalar(f"SELECT COALESCE(SUM(total_price),0) FROM sales s WHERE payment_status='pago'{df}", p)
-    total_profit  = scalar(f"SELECT COALESCE(SUM(profit),0) FROM sales s WHERE payment_status='pago'{df}", p)
-    total_pending = scalar(f"SELECT COALESCE(SUM(total_price),0) FROM sales s WHERE payment_status='pendente'{df}", p)
-    sales_count   = scalar(f"SELECT COUNT(*) FROM sales s WHERE 1=1{df}", p)
-    ticket_medio  = (total_gross / sales_count) if sales_count > 0 else 0
-    total_invested= scalar(f"SELECT COALESCE(SUM(total_order),0) FROM supplier_orders{of}", op)
-    total_expenses= scalar(f"SELECT COALESCE(SUM(amount),0) FROM expenses{ef}", ep)
-    net_result    = total_profit - total_expenses
+    total_gross    = scalar(f"SELECT COALESCE(SUM(total_price),0) FROM sales s WHERE payment_status='pago'{df}", p)
+    total_profit   = scalar(f"SELECT COALESCE(SUM(profit),0) FROM sales s WHERE payment_status='pago'{df}", p)
+    total_pending  = scalar(f"SELECT COALESCE(SUM(total_price),0) FROM sales s WHERE payment_status='pendente'{df}", p)
+    sales_count    = scalar(f"SELECT COUNT(*) FROM sales s WHERE 1=1{df}", p)
+    ticket_medio   = (total_gross / sales_count) if sales_count > 0 else 0
+    total_invested = scalar(f"SELECT COALESCE(SUM(total_order),0) FROM supplier_orders{of}", op)
+    total_expenses = scalar(f"SELECT COALESCE(SUM(amount),0) FROM expenses{ef}", ep)
+    net_result     = total_profit - total_expenses
 
     c.execute(f'''SELECT p.name, SUM(s.quantity) qty, SUM(s.total_price) revenue, SUM(s.profit) profit
         FROM sales s JOIN products p ON s.product_id=p.id WHERE 1=1{df}
@@ -644,8 +681,8 @@ def reports():
     top_products = rows_to_list(c.fetchall())
 
     c.execute(f'''SELECT s.customer_name, s.customer_city, COUNT(*) orders, SUM(s.total_price) spent
-        FROM sales s WHERE 1=1{df} GROUP BY s.customer_id, s.customer_name, s.customer_city
-        ORDER BY spent DESC LIMIT 10''', p)
+        FROM sales s WHERE 1=1{df}
+        GROUP BY s.customer_id, s.customer_name, s.customer_city ORDER BY spent DESC LIMIT 10''', p)
     top_customers = rows_to_list(c.fetchall())
 
     c.execute(f'''SELECT payment_method, COUNT(*) cnt, SUM(total_price) total
@@ -721,4 +758,3 @@ init_db()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
-    
