@@ -7,7 +7,6 @@ load_dotenv()
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 
-# Render uses postgres:// but psycopg2 needs postgresql://
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
@@ -115,11 +114,11 @@ def init_db():
         created_at TIMESTAMP DEFAULT NOW()
     )''')
 
-    # Default admin
-from werkzeug.security import generate_password_hash
-c.execute("DELETE FROM users WHERE username='admin'")
-c.execute("INSERT INTO users (username, password, name) VALUES (%s, %s, %s)",
-          ('admin', generate_password_hash('admin123'), 'Administrador'))
+    # Admin — recria sempre para garantir senha correta
+    from werkzeug.security import generate_password_hash
+    c.execute("DELETE FROM users WHERE username='admin'")
+    c.execute("INSERT INTO users (username, password, name) VALUES (%s, %s, %s)",
+              ('admin', generate_password_hash('admin123'), 'Administrador'))
 
     conn.commit()
     conn.close()
