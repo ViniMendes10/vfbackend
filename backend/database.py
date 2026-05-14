@@ -116,11 +116,10 @@ def init_db():
     )''')
 
     # Default admin
-    from werkzeug.security import generate_password_hash
-    c.execute("SELECT id FROM users WHERE username='admin'")
-    if not c.fetchone():
-        c.execute("INSERT INTO users (username, password, name) VALUES (%s, %s, %s)",
-                  ('admin', generate_password_hash('admin123'), 'Administrador'))
+from werkzeug.security import generate_password_hash
+c.execute("DELETE FROM users WHERE username='admin'")
+c.execute("INSERT INTO users (username, password, name) VALUES (%s, %s, %s)",
+          ('admin', generate_password_hash('admin123'), 'Administrador'))
 
     conn.commit()
     conn.close()
