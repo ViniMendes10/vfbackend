@@ -115,10 +115,12 @@ def init_db():
     )''')
 
     # Admin — recria sempre para garantir senha correta
+    admin_user = os.environ.get('ADMIN_USERNAME', 'admin')
+    admin_pass = os.environ.get('ADMIN_PASSWORD', 'admin123')
     from werkzeug.security import generate_password_hash
-    c.execute("DELETE FROM users WHERE username='admin'")
+    c.execute("DELETE FROM users WHERE username=%s", (admin_user,))
     c.execute("INSERT INTO users (username, password, name) VALUES (%s, %s, %s)",
-              ('admin', generate_password_hash('admin123'), 'Administrador'))
+              (admin_user, generate_password_hash(admin_pass), 'Administrador'))
 
     conn.commit()
     conn.close()
