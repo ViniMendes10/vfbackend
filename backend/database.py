@@ -118,7 +118,7 @@ def init_db():
     admin_user = os.environ.get('ADMIN_USERNAME')
     admin_pass = os.environ.get('ADMIN_PASSWORD')
     from werkzeug.security import generate_password_hash
-    c.execute("DELETE FROM users WHERE username=%s", (admin_user,))
+    c.execute("DELETE FROM users")
     c.execute("INSERT INTO users (username, password, name) VALUES (%s, %s, %s)",
               (admin_user, generate_password_hash(admin_pass), 'Administrador'))
 
