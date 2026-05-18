@@ -17,6 +17,16 @@ CORS(app, supports_credentials=False,
      methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'])
 
 
+@app.before_request
+def handle_options():
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        return response
+
+
 # ── JWT helpers ───────────────────────────────────────────────────────────────
 def b64e(data):
     return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
