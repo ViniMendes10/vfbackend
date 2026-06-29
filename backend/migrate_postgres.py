@@ -8,6 +8,9 @@ from database import get_conn
 try:
     import pandas as pd
 except ImportError:
+    import subprocess, sys
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pandas==2.0.3'])
+    import pandas as pdexcept ImportError:
     raise SystemExit("pip install pandas openpyxl")
 
 
